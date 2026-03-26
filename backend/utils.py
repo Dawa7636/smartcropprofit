@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import accuracy_score, mean_absolute_error, mean_squared_error
@@ -34,6 +36,16 @@ CROP_COLUMN = "crop"
 
 MIN_NUMERIC_VALUE = 0.0
 FORECAST_DAYS = 7
+REQUEST_TIMEOUT_SECONDS = 8
+
+DATA_GOV_BASE_URL = "https://api.data.gov.in/resource"
+# Agmarknet data is published on data.gov.in as resources.
+DATA_GOV_AGMARKNET_RESOURCE_ID = os.getenv("DATA_GOV_AGMARKNET_RESOURCE_ID", "").strip()
+DATA_GOV_API_KEY = os.getenv("DATA_GOV_API_KEY", "").strip()
+
+# Optional custom Agmarknet-style endpoint if you have one available.
+# Example: https://example.com/prices?crop={crop}
+AGMARKNET_PRICE_API_URL = os.getenv("AGMARKNET_PRICE_API_URL", "").strip()
 
 
 def ensure_directories() -> None:
@@ -217,11 +229,119 @@ def validate_request_payload(payload: dict[str, Any]) -> dict[str, float]:
     return features
 
 
-def get_latest_market_price(market_history: pd.DataFrame, crop: str) -> float:
+def _extract_numeric_price(value: Any) -> float | None:
+    try:
+        numeric_value = float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if numeric_value <= 0:
+        return None
+    return numeric_value
+
+
+def _convert_price_to_per_kg(price_value: float, unit: str | None) -> float:
+    normalized_unit = str(unit or "").strip().lower()
+    if "quintal" in normalized_unit or "/q" in normalized_unit:
+        return price_value / 100.0
+    if "kg" in normalized_unit:
+        return price_value
+    # Default assumption for Agmarknet/data.gov modal prices is Rs/quintal.
+    return price_value / 100.0
+
+
+def _fetch_price_from_custom_agmarknet(crop: str) -> float | None:
+    if not AGMARKNET_PRICE_API_URL:
+        return None
+
+    endpoint = AGMARKNET_PRICE_API_URL.format(crop=crop)
+    response = requests.get(endpoint, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("price_per_kg", "modal_price_per_kg", "price"):
+        extracted = _extract_numeric_price(payload.get(key))
+        if extracted is not None:
+            if "kg" in key:
+                return round(extracted, 2)
+            return round(_convert_price_to_per_kg(extracted, payload.get("unit")), 2)
+    return None
+
+
+def _fetch_price_from_data_gov(crop: str) -> float | None:
+    if not DATA_GOV_AGMARKNET_RESOURCE_ID:
+        return None
+
+    params: dict[str, Any] = {
+        "format": "json",
+        "limit": 10,
+        "filters[commodity]": crop.title(),
+    }
+    if DATA_GOV_API_KEY:
+        params["api-key"] = DATA_GOV_API_KEY
+
+    response = requests.get(
+        f"{DATA_GOV_BASE_URL}/{DATA_GOV_AGMARKNET_RESOURCE_ID}",
+        params=params,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        return None
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        price_value = _extract_numeric_price(
+            record.get("modal_price")
+            or record.get("Modal Price")
+            or record.get("price")
+            or record.get("Price")
+        )
+        if price_value is None:
+            continue
+        unit = record.get("unit") or record.get("Unit")
+        return round(_convert_price_to_per_kg(price_value, unit), 2)
+    return None
+
+
+def fetch_realtime_crop_price(crop: str) -> float | None:
+    """
+    Fetch latest crop price via HTTP APIs.
+    Returns None when API access fails so callers can fall back to local CSV.
+    """
+    crop_key = str(crop).strip().lower()
+    if not crop_key:
+        return None
+
+    for fetcher in (_fetch_price_from_custom_agmarknet, _fetch_price_from_data_gov):
+        try:
+            fetched_price = fetcher(crop_key)
+            if fetched_price is not None:
+                return round(fetched_price, 2)
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            continue
+    return None
+
+
+def get_latest_market_price(
+    market_history: pd.DataFrame,
+    crop: str,
+    prefer_realtime: bool = True,
+) -> tuple[float, str]:
+    if prefer_realtime:
+        realtime_price = fetch_realtime_crop_price(crop)
+        if realtime_price is not None:
+            return round(realtime_price, 2), "api"
+
     crop_history = market_history.loc[market_history[CROP_COLUMN] == crop].sort_values(DATE_COLUMN)
     if crop_history.empty:
         raise ValueError(f"No market prices available for crop '{crop}'.")
-    return round(float(crop_history.iloc[-1][MARKET_PRICE_COLUMN]), 2)
+    return round(float(crop_history.iloc[-1][MARKET_PRICE_COLUMN]), 2), "csv_fallback"
 
 
 def estimate_cost(features: dict[str, float], crop: str, crop_costs: dict[str, float]) -> float:
@@ -281,30 +401,7 @@ def forecast_prices(market_history: pd.DataFrame, crop: str, forecast_days: int 
 
 
 def predict_recommendation(payload: dict[str, Any]) -> dict[str, Any]:
-    loaded = load_models()
-    validated_features = validate_request_payload(payload)
-    market_history = load_market_dataset()
-    crop_model = loaded["crop_model"]
-    yield_model = loaded["yield_model"]
-    metadata = loaded["metadata"]
+    # Backward-compatible wrapper for modules importing from `utils`.
+    from recommendation_service import predict_recommendation as _predict_recommendation
 
-    input_frame = pd.DataFrame([validated_features], columns=FEATURE_COLUMNS)
-    recommended_crop = str(crop_model.predict(input_frame)[0])
-
-    yield_frame = pd.DataFrame([{**validated_features, CROP_COLUMN: recommended_crop}])
-    predicted_yield_kg_per_ha = round(float(yield_model.predict(yield_frame)[0]), 2)
-
-    market_price = get_latest_market_price(market_history, recommended_crop)
-    estimated_cost = estimate_cost(validated_features, recommended_crop, metadata["crop_costs"])
-    expected_profit = round((predicted_yield_kg_per_ha * market_price) - estimated_cost, 2)
-    price_forecast = forecast_prices(market_history, recommended_crop)
-
-    return {
-        "recommended_crop": recommended_crop,
-        "predicted_yield_kg_per_ha": predicted_yield_kg_per_ha,
-        "market_price_per_kg": market_price,
-        "cost_per_ha": estimated_cost,
-        "expected_profit": expected_profit,
-        "price_forecast": price_forecast,
-        "model_metrics": metadata["metrics"],
-    }
+    return _predict_recommendation(payload)

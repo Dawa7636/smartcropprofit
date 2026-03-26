@@ -10,7 +10,8 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from utils import FEATURE_COLUMNS, load_models, predict_recommendation
+from recommendation_service import predict_recommendation
+from utils import FEATURE_COLUMNS, load_models
 
 
 def create_app() -> Flask:
