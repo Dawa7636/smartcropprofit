@@ -28,7 +28,7 @@ def create_app() -> Flask:
                 "model_metrics": models["metadata"]["metrics"],
             }
         )
-
+    
     @app.post("/api/recommend")
     def recommend():
         payload = request.get_json(silent=True)
